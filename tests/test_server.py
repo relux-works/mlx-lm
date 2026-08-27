@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import requests
@@ -196,6 +197,56 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(text, "f[ARGS]{}")
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
+
+
+class TestResponseGeneratorHealth(unittest.TestCase):
+    def test_health_tracks_generation_thread(self):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        response_generator._generation_thread = mock.Mock()
+
+        response_generator._generation_thread.is_alive.return_value = True
+        self.assertTrue(response_generator.is_healthy)
+
+        response_generator._generation_thread.is_alive.return_value = False
+        self.assertFalse(response_generator.is_healthy)
+
+
+class TestHealthEndpoint(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = mock.Mock()
+        cls.response_generator.cli_args.allowed_origins = ["*"]
+        cls.response_generator.is_healthy = True
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+
+    def test_health_reflects_generation_thread_liveness(self):
+        url = f"http://localhost:{self.port}/health"
+
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+        self.response_generator.is_healthy = False
+        try:
+            response = requests.get(url)
+        finally:
+            self.response_generator.is_healthy = True
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "unavailable"})
 
 
 class TestServer(unittest.TestCase):
