@@ -10,7 +10,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -20,6 +20,40 @@ from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
+    def test_qwen3_5_make_cache_honors_max_kv_size(self):
+        from mlx_lm.models import qwen3_5
+
+        args = qwen3_5.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "vocab_size": 1000,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 3,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 64,
+                "max_position_embeddings": 1000,
+            }
+        )
+        model = qwen3_5.Model(args)
+
+        bounded = make_prompt_cache(model, max_kv_size=8)
+        self.assertEqual(len(bounded), 4)
+        for cache in bounded[:3]:
+            self.assertIsInstance(cache, ArraysCache)
+        self.assertIsInstance(bounded[3], RotatingKVCache)
+        self.assertEqual(bounded[3].max_size, 8)
+
+        unbounded = make_prompt_cache(model)
+        self.assertIsInstance(unbounded[3], KVCache)
+
     def test_kv_cache(self):
         cache = KVCache()
 

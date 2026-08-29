@@ -40,7 +40,13 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    ArraysCache,
+    BatchRotatingKVCache,
+    LRUPromptCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -48,6 +54,17 @@ from .utils import _parse_size, load, sharded_load
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+def _cache_max_kv_size(prompt_cache):
+    bounds = set()
+    for cache in prompt_cache:
+        if isinstance(cache, ArraysCache):
+            continue
+        if not isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
+            return None
+        bounds.add(cache.max_size)
+    return bounds.pop() if len(bounds) == 1 else None
 
 
 class ToolCallFormatter:
@@ -427,6 +444,7 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        self._active_max_kv_size = None
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
@@ -440,6 +458,10 @@ class ResponseGenerator:
     @property
     def is_healthy(self):
         return self._generation_thread.is_alive()
+
+    @property
+    def active_max_kv_size(self):
+        return self._active_max_kv_size
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -692,6 +714,11 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
+                    if cache is None:
+                        cache = make_prompt_cache(
+                            self.model_provider.model, batch_generator.max_kv_size
+                        )
+                    self._active_max_kv_size = _cache_max_kv_size(cache)
                     prompt_cache_count = len(prompt) - len(rest)
                     N = prompt_cache_count
                     while N > 0:
@@ -763,6 +790,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        max_kv_size=self.cli_args.max_kv_size,
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -917,9 +945,14 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                cache = make_prompt_cache(
+                    self.model_provider.model, self.cli_args.max_kv_size
+                )
                 if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                    cache += make_prompt_cache(
+                        self.model_provider.draft_model, self.cli_args.max_kv_size
+                    )
+            self._active_max_kv_size = _cache_max_kv_size(cache)
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
@@ -1648,26 +1681,23 @@ class APIHandler(BaseHTTPRequestHandler):
         ]
 
         # Create a list of available models
-        models = [
-            {
-                "id": repo.repo_id,
+        def model_entry(model_id):
+            entry = {
+                "id": model_id,
                 "object": "model",
                 "created": self.created,
             }
-            for repo in downloaded_models
-        ]
+            if self.response_generator.active_max_kv_size is not None:
+                entry["meta"] = {"n_ctx": self.response_generator.active_max_kv_size}
+            return entry
+
+        models = [model_entry(repo.repo_id) for repo in downloaded_models]
 
         if self.response_generator.cli_args.model:
             model_path = Path(self.response_generator.cli_args.model)
             if model_path.exists():
                 model_id = str(model_path.resolve())
-                models.append(
-                    {
-                        "id": model_id,
-                        "object": "model",
-                        "created": self.created,
-                    }
-                )
+                models.append(model_entry(model_id))
 
         response = {"object": "list", "data": models}
 
@@ -1844,6 +1874,12 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Set the maximum key-value cache size",
     )
     parser.add_argument(
         "--prompt-cache-size",

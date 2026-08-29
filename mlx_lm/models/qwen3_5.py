@@ -8,12 +8,8 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
-from .base import (
-    BaseModelArgs,
-    create_attention_mask,
-    create_ssm_mask,
-)
-from .cache import ArraysCache, KVCache
+from .base import BaseModelArgs, create_attention_mask, create_ssm_mask
+from .cache import ArraysCache, KVCache, RotatingKVCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -342,8 +338,19 @@ class TextModel(nn.Module):
     def layers(self):
         return self.model.pipeline_layers
 
-    def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+    def make_cache(self, max_kv_size: Optional[int] = None):
+        return [
+            (
+                ArraysCache(size=2)
+                if layer.is_linear
+                else (
+                    RotatingKVCache(max_size=max_kv_size, keep=4)
+                    if max_kv_size is not None
+                    else KVCache()
+                )
+            )
+            for layer in self.layers
+        ]
 
     def sanitize(self, weights):
         has_unsanitized_conv1d = any(
@@ -562,8 +569,8 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.pipeline_layers
 
-    def make_cache(self):
-        return self.language_model.make_cache()
+    def make_cache(self, max_kv_size: Optional[int] = None):
+        return self.language_model.make_cache(max_kv_size=max_kv_size)
 
     @property
     def quant_predicate(self):

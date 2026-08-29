@@ -5,13 +5,15 @@ import io
 import json
 import threading
 import unittest
+from queue import Queue
+from types import SimpleNamespace
 from unittest import mock
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.generate import TextStateMachine
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
@@ -53,6 +55,7 @@ class DummyModelProvider:
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
+                "max_kv_size": None,
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
@@ -209,6 +212,252 @@ class TestResponseGeneratorHealth(unittest.TestCase):
 
         response_generator._generation_thread.is_alive.return_value = False
         self.assertFalse(response_generator.is_healthy)
+
+
+class TestResponseGeneratorKVBound(unittest.TestCase):
+    def test_seeded_single_generation_constructs_a_bounded_cache(self):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        model = object()
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+        )
+        response_generator.model_provider = SimpleNamespace(
+            model=model,
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=SimpleNamespace(max_kv_size=76800, prefill_step_size=2048),
+        )
+        response_generator.prompt_cache = mock.Mock()
+        response_generator.prompt_cache.fetch_nearest_cache.return_value = (
+            None,
+            [1, 2],
+        )
+        response_generator._log_cache_stats = mock.Mock()
+        response_generator._tokenize = mock.Mock(
+            return_value=([1, 2], [[1, 2]], ["assistant"], "normal")
+        )
+        stop_matcher = mock.Mock()
+        stop_matcher.make_state.return_value = object()
+        response_generator._make_state_machine = mock.Mock(
+            return_value=(stop_matcher, mock.Mock())
+        )
+        response_generator._is_distributed = False
+        response_generator._active_max_kv_size = None
+
+        args = SimpleNamespace(
+            stop_words=[],
+            seed=1234,
+            max_tokens=1,
+            num_draft_tokens=0,
+            top_logprobs=0,
+        )
+        response_queue = Queue()
+
+        with (
+            mock.patch("mlx_lm.server._make_sampler", return_value=mock.Mock()),
+            mock.patch("mlx_lm.server._make_logits_processors", return_value=[]),
+            mock.patch(
+                "mlx_lm.server.make_prompt_cache",
+                return_value=[ArraysCache(size=2), RotatingKVCache(max_size=76800)],
+            ) as cache,
+            mock.patch("mlx_lm.server.stream_generate", return_value=iter(())),
+        ):
+            response_generator._serve_single((response_queue, SimpleNamespace(), args))
+
+        cache.assert_called_once_with(model, 76800)
+        self.assertEqual(response_generator.active_max_kv_size, 76800)
+
+    def test_seeded_single_generation_does_not_attest_an_ignored_bound(self):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+        )
+        response_generator.model_provider = SimpleNamespace(
+            model=object(),
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=("model", None, None),
+            cli_args=SimpleNamespace(max_kv_size=76800, prefill_step_size=2048),
+        )
+        response_generator.prompt_cache = mock.Mock()
+        response_generator.prompt_cache.fetch_nearest_cache.return_value = (
+            None,
+            [1, 2],
+        )
+        response_generator._log_cache_stats = mock.Mock()
+        response_generator._tokenize = mock.Mock(
+            return_value=([1, 2], [[1, 2]], ["assistant"], "normal")
+        )
+        stop_matcher = mock.Mock()
+        stop_matcher.make_state.return_value = object()
+        response_generator._make_state_machine = mock.Mock(
+            return_value=(stop_matcher, mock.Mock())
+        )
+        response_generator._is_distributed = False
+        response_generator._active_max_kv_size = None
+
+        args = SimpleNamespace(
+            stop_words=[],
+            seed=1234,
+            max_tokens=1,
+            num_draft_tokens=0,
+            top_logprobs=0,
+        )
+
+        with (
+            mock.patch("mlx_lm.server._make_sampler", return_value=mock.Mock()),
+            mock.patch("mlx_lm.server._make_logits_processors", return_value=[]),
+            mock.patch("mlx_lm.server.make_prompt_cache", return_value=[KVCache()]),
+            mock.patch("mlx_lm.server.stream_generate", return_value=iter(())),
+        ):
+            response_generator._serve_single((Queue(), SimpleNamespace(), args))
+
+        self.assertIsNone(response_generator.active_max_kv_size)
+
+    def test_seeded_single_generation_does_not_attest_mixed_target_and_draft_caches(
+        self,
+    ):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        target_model = object()
+        draft_model = object()
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+        )
+        response_generator.model_provider = SimpleNamespace(
+            model=target_model,
+            tokenizer=tokenizer,
+            draft_model=draft_model,
+            model_key=("model", None, "draft"),
+            cli_args=SimpleNamespace(
+                model=None, max_kv_size=76800, prefill_step_size=2048
+            ),
+        )
+        response_generator.prompt_cache = mock.Mock()
+        response_generator.prompt_cache.fetch_nearest_cache.return_value = (
+            None,
+            [1, 2],
+        )
+        response_generator._log_cache_stats = mock.Mock()
+        response_generator._tokenize = mock.Mock(
+            return_value=([1, 2], [[1, 2]], ["assistant"], "normal")
+        )
+        stop_matcher = mock.Mock()
+        stop_matcher.make_state.return_value = object()
+        response_generator._make_state_machine = mock.Mock(
+            return_value=(stop_matcher, mock.Mock())
+        )
+        response_generator._is_distributed = False
+        response_generator._active_max_kv_size = None
+
+        args = SimpleNamespace(
+            stop_words=[],
+            seed=1234,
+            max_tokens=1,
+            num_draft_tokens=1,
+            top_logprobs=0,
+        )
+
+        with (
+            mock.patch("mlx_lm.server._make_sampler", return_value=mock.Mock()),
+            mock.patch("mlx_lm.server._make_logits_processors", return_value=[]),
+            mock.patch(
+                "mlx_lm.server.make_prompt_cache",
+                side_effect=[
+                    [ArraysCache(size=2), RotatingKVCache(max_size=76800)],
+                    [KVCache()],
+                ],
+            ) as make_cache,
+            mock.patch("mlx_lm.server.stream_generate", return_value=iter(())),
+        ):
+            response_generator._serve_single((Queue(), SimpleNamespace(), args))
+
+        self.assertEqual(
+            make_cache.call_args_list,
+            [mock.call(target_model, 76800), mock.call(draft_model, 76800)],
+        )
+        self.assertIsNone(response_generator.active_max_kv_size)
+
+        repo = SimpleNamespace(
+            repo_type="model",
+            repo_id="mixed-cache-model",
+            refs={
+                "main": SimpleNamespace(
+                    files=[
+                        SimpleNamespace(file_path=SimpleNamespace(name=name))
+                        for name in [
+                            "config.json",
+                            "model.safetensors.index.json",
+                            "tokenizer_config.json",
+                        ]
+                    ]
+                )
+            },
+        )
+        handler = APIHandler.__new__(APIHandler)
+        handler.response_generator = response_generator
+        handler.created = 0
+        handler.path = "/v1/models"
+        handler.wfile = io.BytesIO()
+        handler._set_completion_headers = mock.Mock()
+        handler.end_headers = mock.Mock()
+        with mock.patch(
+            "mlx_lm.server.scan_cache_dir",
+            return_value=SimpleNamespace(repos=[repo]),
+        ):
+            handler.handle_models_request()
+
+        models = json.loads(handler.wfile.getvalue())["data"]
+        self.assertEqual(len(models), 1)
+        self.assertNotIn("meta", models[0])
+
+    def test_batch_generation_passes_the_bound_to_batch_generator(self):
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        response_generator._time_budget = mock.Mock()
+        response_generator._is_distributed = False
+        response_generator._rank = 0
+        response_generator._stop = False
+        response_generator._active_max_kv_size = None
+
+        model = object()
+        tokenizer = object()
+        cli_args = SimpleNamespace(
+            decode_concurrency=4,
+            prompt_concurrency=2,
+            prefill_step_size=2048,
+            max_kv_size=76800,
+        )
+        model_provider = mock.Mock()
+        model_provider.cli_args = cli_args
+        model_provider.model_key = ("model", None, None)
+        model_provider.is_batchable = True
+        model_provider.load.return_value = (model, tokenizer)
+        response_generator.model_provider = model_provider
+
+        generation_args = SimpleNamespace(
+            model=SimpleNamespace(model="model", adapter=None, draft=None),
+            seed=None,
+        )
+        response_generator._next_request = mock.Mock(
+            return_value=(Queue(), SimpleNamespace(), generation_args)
+        )
+
+        def construct(*args, **kwargs):
+            response_generator._stop = True
+            return SimpleNamespace(max_kv_size=kwargs["max_kv_size"])
+
+        with mock.patch("mlx_lm.server.BatchGenerator", side_effect=construct) as batch:
+            response_generator._generate()
+
+        batch.assert_called_once()
+        self.assertEqual(batch.call_args.kwargs["max_kv_size"], 76800)
+        self.assertIsNone(response_generator.active_max_kv_size)
 
 
 class TestHealthEndpoint(unittest.TestCase):
@@ -418,6 +667,35 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+        self.assertNotIn("meta", model)
+
+    def test_handle_models_does_not_report_an_inactive_configured_bound(self):
+        url = f"http://localhost:{self.port}/v1/models"
+        self.response_generator.cli_args.max_kv_size = 76800
+        try:
+            response = requests.get(url)
+        finally:
+            self.response_generator.cli_args.max_kv_size = None
+
+        self.assertEqual(response.status_code, 200)
+        models = response.json()["data"]
+        self.assertGreater(len(models), 0)
+        for model in models:
+            self.assertNotIn("meta", model)
+
+    def test_handle_models_reports_the_active_kv_bound(self):
+        url = f"http://localhost:{self.port}/v1/models"
+        self.response_generator._active_max_kv_size = 76800
+        try:
+            response = requests.get(url)
+        finally:
+            self.response_generator._active_max_kv_size = None
+
+        self.assertEqual(response.status_code, 200)
+        models = response.json()["data"]
+        self.assertGreater(len(models), 0)
+        for model in models:
+            self.assertEqual(model["meta"], {"n_ctx": 76800})
 
 
 class TestServerWithDraftModel(unittest.TestCase):

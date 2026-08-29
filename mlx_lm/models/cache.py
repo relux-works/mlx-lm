@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import inspect
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -20,16 +21,21 @@ def make_prompt_cache(
     Construct the model's cache for use in generation.
 
     This function will defer the cache construction to the model if it has a
-    ``make_cache`` method, otherwise it will make a default KV cache.
+    ``make_cache`` method. Models that accept ``max_kv_size`` receive the bound.
 
     Args:
         model (nn.Module): The language model.
-        max_kv_size (Optional[int]): If provided and the model does not have a
-            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
-            size of ``max_kv_size``
+        max_kv_size (Optional[int]): If provided, use a ``RotatingKVCache`` with
+            this maximum size when the model supports bounded caches.
     """
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        make_cache = model.make_cache
+        if (
+            max_kv_size is not None
+            and "max_kv_size" in inspect.signature(make_cache).parameters
+        ):
+            return make_cache(max_kv_size=max_kv_size)
+        return make_cache()
 
     num_layers = len(model.layers)
     if max_kv_size is not None:
