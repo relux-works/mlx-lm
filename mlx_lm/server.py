@@ -1687,8 +1687,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 "object": "model",
                 "created": self.created,
             }
+            runtime_config = {
+                "prefill_step_size": self.response_generator.cli_args.prefill_step_size,
+            }
+            reasoning_effort = getattr(
+                self.response_generator.cli_args, "chat_template_args", {}
+            ).get("reasoning_effort")
+            if isinstance(reasoning_effort, str):
+                runtime_config["reasoning_effort"] = reasoning_effort
+            entry["meta"] = {"runtime_config": runtime_config}
             if self.response_generator.active_max_kv_size is not None:
-                entry["meta"] = {"n_ctx": self.response_generator.active_max_kv_size}
+                entry["meta"]["n_ctx"] = self.response_generator.active_max_kv_size
             return entry
 
         models = [model_entry(repo.repo_id) for repo in downloaded_models]

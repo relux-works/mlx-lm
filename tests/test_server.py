@@ -415,7 +415,10 @@ class TestResponseGeneratorKVBound(unittest.TestCase):
 
         models = json.loads(handler.wfile.getvalue())["data"]
         self.assertEqual(len(models), 1)
-        self.assertNotIn("meta", models[0])
+        self.assertEqual(
+            models[0]["meta"],
+            {"runtime_config": {"prefill_step_size": 2048}},
+        )
 
     def test_batch_generation_passes_the_bound_to_batch_generator(self):
         response_generator = ResponseGenerator.__new__(ResponseGenerator)
@@ -667,7 +670,31 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
-        self.assertNotIn("meta", model)
+        self.assertEqual(
+            model["meta"],
+            {"runtime_config": {"prefill_step_size": 2048}},
+        )
+
+    def test_handle_models_reports_effective_generation_configuration(self):
+        url = f"http://localhost:{self.port}/v1/models"
+        self.response_generator.cli_args.prefill_step_size = 999
+        self.response_generator.cli_args.chat_template_args = {
+            "reasoning_effort": "medium"
+        }
+        try:
+            response = requests.get(url)
+        finally:
+            self.response_generator.cli_args.prefill_step_size = 2048
+            self.response_generator.cli_args.chat_template_args = {}
+
+        self.assertEqual(response.status_code, 200)
+        models = response.json()["data"]
+        self.assertGreater(len(models), 0)
+        for model in models:
+            self.assertEqual(
+                model["meta"]["runtime_config"],
+                {"prefill_step_size": 999, "reasoning_effort": "medium"},
+            )
 
     def test_handle_models_does_not_report_an_inactive_configured_bound(self):
         url = f"http://localhost:{self.port}/v1/models"
@@ -681,7 +708,11 @@ class TestServer(unittest.TestCase):
         models = response.json()["data"]
         self.assertGreater(len(models), 0)
         for model in models:
-            self.assertNotIn("meta", model)
+            self.assertNotIn("n_ctx", model["meta"])
+            self.assertEqual(
+                model["meta"]["runtime_config"],
+                {"prefill_step_size": 2048},
+            )
 
     def test_handle_models_reports_the_active_kv_bound(self):
         url = f"http://localhost:{self.port}/v1/models"
@@ -695,7 +726,11 @@ class TestServer(unittest.TestCase):
         models = response.json()["data"]
         self.assertGreater(len(models), 0)
         for model in models:
-            self.assertEqual(model["meta"], {"n_ctx": 76800})
+            self.assertEqual(model["meta"]["n_ctx"], 76800)
+            self.assertEqual(
+                model["meta"]["runtime_config"],
+                {"prefill_step_size": 2048},
+            )
 
 
 class TestServerWithDraftModel(unittest.TestCase):
