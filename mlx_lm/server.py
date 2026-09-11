@@ -67,6 +67,27 @@ def _cache_max_kv_size(prompt_cache):
     return bounds.pop() if len(bounds) == 1 else None
 
 
+def _report_kv_cache_bound_if_exceeded(request_id, active_max_kv_size, observed_tokens):
+    """Emit one explicit, greppable log record when a completed request's
+    total token count exceeded the active generation KV cache bound.
+
+    A bounded RotatingKVCache does not refuse an oversized request: once its
+    ring wraps it silently overwrites the oldest tokens, so the resulting
+    truncated context is otherwise indistinguishable from one that fit
+    cleanly (see RotatingKVCache._update_in_place / _update_concat). This is
+    the one place, once per completed request, that makes that silent
+    truncation observable.
+    """
+    if active_max_kv_size is None or observed_tokens <= active_max_kv_size:
+        return
+    logging.warning(
+        "kv_cache_bound_exceeded request_id=%s max_kv_size=%d observed_tokens=%d",
+        request_id,
+        active_max_kv_size,
+        observed_tokens,
+    )
+
+
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
         self._idx = 0
@@ -1539,6 +1560,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+
+            _report_kv_cache_bound_if_exceeded(
+                self.request_id,
+                self.response_generator.active_max_kv_size,
+                len(ctx.prompt) + len(tokens),
+            )
 
             if self.stream:
                 resp = self.generate_response(

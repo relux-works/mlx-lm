@@ -3,6 +3,8 @@
 import http
 import io
 import json
+import logging
+import re
 import threading
 import unittest
 from queue import Queue
@@ -30,7 +32,7 @@ from mlx_lm.utils import load
 
 
 class DummyModelProvider:
-    def __init__(self, with_draft=False):
+    def __init__(self, with_draft=False, max_kv_size=None):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
@@ -59,7 +61,7 @@ class DummyModelProvider:
                 "decode_concurrency": 32,
                 "prompt_concurrency": 8,
                 "prefill_step_size": 2048,
-                "max_kv_size": None,
+                "max_kv_size": max_kv_size,
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
@@ -735,6 +737,89 @@ class TestServer(unittest.TestCase):
                 model["meta"]["runtime_config"],
                 {"prefill_step_size": 2048},
             )
+
+
+class _CapturingLogHandler(logging.Handler):
+    def __init__(self, level=logging.WARNING):
+        super().__init__(level=level)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+class TestKVCacheBoundExceededLogging(unittest.TestCase):
+    """A request whose prompt plus generated tokens exceed the active KV
+    bound must produce one greppable `kv_cache_bound_exceeded` warning naming
+    the request, the bound, and the observed token count; a request that
+    fits within the bound must produce none. Removing the guard call in
+    `handle_completion` turns `test_request_exceeding_bound_logs_once` red
+    while leaving `test_request_under_bound_logs_nothing` green, so the two
+    together narrow the check rather than merely exercising the code path.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.max_kv_size = 8
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(max_kv_size=cls.max_kv_size), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def _post_completion(self, prompt, max_tokens):
+        handler = _CapturingLogHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        try:
+            response = requests.post(
+                f"http://localhost:{self.port}/v1/completions",
+                json={
+                    "model": "default_model",
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                },
+            )
+        finally:
+            root_logger.removeHandler(handler)
+        self.assertEqual(response.status_code, 200)
+        response_id = response.json()["id"]
+        return response_id, handler.messages
+
+    def test_request_under_bound_logs_nothing(self):
+        response_id, messages = self._post_completion(prompt="Hi", max_tokens=1)
+
+        bound_messages = [m for m in messages if "kv_cache_bound_exceeded" in m]
+        self.assertEqual(bound_messages, [])
+
+    def test_request_exceeding_bound_logs_once(self):
+        response_id, messages = self._post_completion(
+            prompt="Once upon a time there was a very small dog",
+            max_tokens=10,
+        )
+
+        bound_messages = [m for m in messages if "kv_cache_bound_exceeded" in m]
+        self.assertEqual(len(bound_messages), 1)
+        self.assertIn(f"request_id={response_id}", bound_messages[0])
+        self.assertIn(f"max_kv_size={self.max_kv_size}", bound_messages[0])
+        match = re.search(r"observed_tokens=(\d+)", bound_messages[0])
+        self.assertIsNotNone(match)
+        self.assertGreater(int(match.group(1)), self.max_kv_size)
 
 
 class TestServerWithDraftModel(unittest.TestCase):
